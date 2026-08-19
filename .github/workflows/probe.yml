@@ -1,0 +1,80 @@
+name: probe
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'A=partial bake failure, B=bake green + updater fails + push probe'
+        required: true
+        default: 'A'
+permissions:
+  contents: read
+jobs:
+  bake:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        leg: [ok1, ok2, bad]
+    steps:
+      - name: leg
+        env:
+          LEG: ${{ matrix.leg }}
+          MODE: ${{ inputs.mode }}
+        run: |
+          if [ "$LEG" = "bad" ] && [ "$MODE" = "A" ]; then echo "leg fails (mode A)"; exit 1; fi
+          echo "leg ok"
+  update-gated-success:
+    needs: bake
+    if: success()
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "RAN (success gate)"
+  update-gated-notcancelled:
+    needs: bake
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: pip install boto3 exactly as PR 4348 does
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet boto3
+          python3 -c "import boto3; print('boto3', boto3.__version__)"
+      - name: fail deliberately in mode B (simulates updater failure)
+        if: ${{ inputs.mode == 'B' }}
+        run: exit 1
+  push-probe:
+    needs: bake
+    if: ${{ inputs.mode == 'B' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: master
+      - name: commit and push to protected master (mirror of PR 4348)
+        run: |
+          set -euo pipefail
+          date > probe.txt
+          git config user.name "probe-bot"
+          git config user.email "actions@github.com"
+          git add probe.txt
+          git commit -m "probe: direct push to protected master"
+          set +e
+          git push origin HEAD:master >/tmp/push.log 2>&1
+          rc=$?
+          set -e
+          cat /tmp/push.log
+          if grep -qi "protected branch" /tmp/push.log; then
+            echo "RESULT: PUSH_REJECTED_BY_PROTECTION (rc=$rc)"
+          elif [ "$rc" -eq 0 ]; then
+            echo "RESULT: PUSH_SUCCEEDED (rc=0)"
+          else
+            echo "RESULT: PUSH_FAILED_OTHER (rc=$rc)"
+          fi
+  notify:
+    needs: bake
+    if: failure()
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "NOTIFY FIRED"
